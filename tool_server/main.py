@@ -1,88 +1,108 @@
+# tool_server/general_tools_agent.py
+
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import httpx
+import json
+
+# A2A SDK Imports
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.tasks import TaskUpdater
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.server.apps import A2AStarletteApplication
+from a2a.types import AgentCard, AgentSkill, TextPart, Part
+
+# Tooling Imports
 from duckduckgo_search import DDGS
 
-app = FastAPI(title="AgentOS Tool Server")
-
-class ToolExecutionRequest(BaseModel):
-    tool_name: str
-    args: dict
-
-class ToolExecutionResponse(BaseModel):
-    status: str
-    result: str | list | dict
+# --- Tool Implementation ---
 
 MOCK_CALENDAR = {
-    "testuser": {
-        "today": "10 AM: Standup. 2 PM: Dentist appointment.",
-        "tomorrow": "All day: Working on the AgentOS project.",
-    },
-    "jane": {
-        "today": "Morning: Yoga. Afternoon: Write project proposal.",
-        "tomorrow": "9 AM: Team Sync. 1 PM: Lunch with Alex.",
-    }
+    "testuser": {"today": "10 AM: Standup", "tomorrow": "2 PM: Project brainstorming"},
+    "jane": {"today": "Morning: Yoga", "tomorrow": "1 PM: Lunch with Alex"}
 }
 
-def web_search(query: str) -> list[dict]:
-    # ... (this function remains the same)
-    print(f"TOOL SERVER: Performing web search for query: '{query}'")
+def web_search(query: str) -> str:
+    print(f"GENERAL_TOOLS: Performing web search for: '{query}'")
     try:
         with DDGS() as ddgs:
             results = [r for r in ddgs.text(query, max_results=3)]
-        print(f"TOOL SERVER: Found {len(results)} results.")
-        return results
+        return json.dumps(results) if results else "No results found."
     except Exception as e:
-        return [{"error": f"Failed to perform web search: {e}"}]
+        return json.dumps({"error": f"Failed to perform web search: {e}"})
 
 def check_calendar(user: str, date: str) -> str:
-    """
-    Checks a user's mock calendar for a specific date.
-    NOW with smarter date interpretation.
-    """
-    print(f"TOOL SERVER: Checking calendar for user '{user}' on date: '{date}'")
+    print(f"GENERAL_TOOLS: Checking calendar for user '{user}' on date '{date}'")
     user_calendar = MOCK_CALENDAR.get(user.lower(), {})
-    
-    # --- NEW: Smarter Date Logic ---
     lower_date = date.lower()
-    search_key = lower_date
-    
-    # Handle relative terms by mapping them to our mock data keys
-    if "today" in lower_date or "tonight" in lower_date or "afternoon" in lower_date or "evening" in lower_date:
-        search_key = "today"
-    elif "tomorrow" in lower_date:
-        search_key = "tomorrow"
-        
-    events = user_calendar.get(search_key, f"You have nothing scheduled on {date}.")
+    search_key = "today" if "today" in lower_date else "tomorrow"
+    events = user_calendar.get(search_key, "You have nothing scheduled.")
     return f"On {date}, your schedule is: {events}"
 
-def add_to_calendar(user: str, date: str, time: str, description: str) -> str:
-    # ... (this function remains the same)
-    print(f"TOOL SERVER: Adding event for user '{user}' on {date} at {time}: '{description}'")
-    if user not in MOCK_CALENDAR: MOCK_CALENDAR[user] = {}
-    new_event = f"{time}: {description}"
-    if date in MOCK_CALENDAR[user]: MOCK_CALENDAR[user][date] += f". {new_event}"
-    else: MOCK_CALENDAR[user][date] = new_event
-    return f"Success: The event '{description}' has been added to {user}'s calendar for {date} at {time}."
+# --- A2A AgentExecutor Implementation ---
 
-@app.post("/execute_tool", response_model=ToolExecutionResponse)
-async def execute_tool(request: ToolExecutionRequest):
-    # ... (this function remains the same, no changes needed here)
-    print(f"TOOL SERVER: Received request to execute tool: '{request.tool_name}' with args: {request.args}")
-    if request.tool_name == "web_search":
-        if "query" not in request.args: raise HTTPException(status_code=400, detail="Missing 'query'")
-        return ToolExecutionResponse(status="success", result=web_search(query=request.args["query"]))
-    elif request.tool_name == "check_calendar":
-        if "date" not in request.args or "user" not in request.args: raise HTTPException(status_code=400, detail="Missing 'date' or 'user'")
-        return ToolExecutionResponse(status="success", result=check_calendar(user=request.args["user"], date=request.args["date"]))
-    elif request.tool_name == "add_to_calendar":
-        required_args = ["user", "date", "time", "description"]
-        if not all(k in request.args for k in required_args): raise HTTPException(status_code=400, detail=f"Missing args. Required: {required_args}")
-        return ToolExecutionResponse(status="success", result=add_to_calendar(**request.args))
-    else:
-        raise HTTPException(status_code=404, detail=f"Tool '{request.tool_name}' not found.")
+class GeneralToolsExecutor(AgentExecutor):
+    async def execute(self, context: RequestContext, event_queue: EventQueue):
+        task_updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+        
+        try:
+            tool_call_str = context.get_user_input()
+            tool_call = json.loads(tool_call_str)
+            tool_name = tool_call.get("tool_name")
+            tool_args = tool_call.get("args", {})
+            
+            result_str = ""
+            if tool_name == "web_search":
+                result_str = web_search(**tool_args)
+            elif tool_name == "check_calendar":
+                result_str = check_calendar(**tool_args)
+            else:
+                result_str = f"Error: Tool '{tool_name}' not supported by this agent."
+                
+            final_message = task_updater.new_agent_message(parts=[Part(root=TextPart(text=result_str))])
+            await task_updater.complete(message=final_message)
 
+        except Exception as e:
+            error_message = task_updater.new_agent_message(parts=[Part(root=TextPart(text=f"Tool execution failed: {e}"))])
+            await task_updater.failed(message=error_message)
+    
+    async def cancel(self, context: RequestContext, event_queue: EventQueue):
+        pass
+
+# --- Agent Server Setup ---
 if __name__ == "__main__":
-    print("--- Starting AgentOS Tool Server ---")
-    print("Available Tools: [web_search, check_calendar, add_to_calendar]")
+    AGENT_DID = "did:agent:general_tools"
+    AGENT_URL = f"http://localhost:8003/a2a/{AGENT_DID}"
+    REGISTRY_URL = "http://localhost:8004"
+    
+    agent_card = AgentCard(
+        name="General Tools Agent",
+        description="A worker agent providing web search and calendar checking tools.",
+        version="1.0",
+        url=AGENT_URL,
+        capabilities={"streaming": False},
+        defaultInputModes=["application/json"],
+        defaultOutputModes=["application/json"],
+        skills=[
+            AgentSkill(id="web_search", name="Web Search", description="Performs a web search.", tags=["search"]),
+            AgentSkill(id="check_calendar", name="Check Calendar", description="Checks a user's mock calendar.", tags=["calendar"])
+        ]
+    )
+    
+    executor = GeneralToolsExecutor()
+    handler = DefaultRequestHandler(agent_executor=executor, task_store=InMemoryTaskStore())
+    a2a_app = A2AStarletteApplication(agent_card=agent_card, http_handler=handler)
+
+    async def startup_event():
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(f"{REGISTRY_URL}/register", json={"agent_card": agent_card.model_dump(mode='json')})
+            print(f"GENERAL_TOOLS: Successfully registered with DID '{AGENT_DID}'.")
+        except Exception as e:
+            print(f"GENERAL_TOOLS: CRITICAL - Could not register with directory. Error: {e}")
+
+    app = a2a_app.build(rpc_url=f"/a2a/{AGENT_DID}", on_startup=[startup_event])
+    
+    print("--- Starting General Tools Agent Server ---")
     uvicorn.run(app, host="127.0.0.1", port=8003)

@@ -1,142 +1,100 @@
-# notion_agent.py
+# tool_server/notion_agent.py
 
 import uvicorn
 import httpx
 import json
-import os
 import traceback
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
-from fastapi.responses import JSONResponse
-# --- NEW: Import the Notion Client ---
 import notion_client
 
-# A2A Imports
-from a2a.types import AgentCard, AgentSkill, Message, SendMessageSuccessResponse, SendMessageRequest, Role
-from a2a.client import create_text_message_object
+# A2A SDK Imports
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.tasks import TaskUpdater
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.server.apps import A2AStarletteApplication
+from a2a.types import AgentCard, AgentSkill, TextPart, Part
 
-app = FastAPI(title="AgentOS Notion Agent")
+class NotionAgentExecutor(AgentExecutor):
+    def get_api_key_from_context(self, context: RequestContext) -> str:
+        """Securely extract the API key from the call context provided by the SDK."""
+        headers = context.call_context.state.get("headers", {})
+        api_key = headers.get("x-notion-api-key")
+        if not api_key:
+            raise PermissionError("Notion API key was not provided in the 'X-Notion-API-Key' header.")
+        return api_key
 
-# --- Agent Identity ---
-NOTION_AGENT_DID = "did:agent:notion"
-NOTION_AGENT_URL = f"http://localhost:8005/a2a/{NOTION_AGENT_DID}"
-REGISTRY_URL = "http://localhost:8004"
+    def create_page_in_database(self, database_id: str, title: str, content: str, api_key: str) -> dict:
+        try:
+            notion = notion_client.Client(auth=api_key)
+            print(f"NOTION AGENT: Authenticated to Notion. Creating page titled '{title}'.")
+            
+            parent = {"database_id": database_id}
+            properties = {"title": {"title": [{"text": {"content": title}}]}}
+            children = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": content}}]}}]
+            
+            response = notion.pages.create(parent=parent, properties=properties, children=children)
+            print(f"NOTION AGENT: Page created successfully. URL: {response['url']}")
+            return {"status": "success", "page_url": response['url']}
+        except notion_client.errors.APIResponseError as e:
+            print(f"NOTION AGENT: Notion API Error - {e}")
+            return {"error": f"Notion API Error: {e.body}"}
+        except Exception as e:
+            print(f"NOTION AGENT: An unexpected error occurred - {e}")
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
-# --- 1. Implement the REAL Tool Logic ---
-def create_page_in_database(database_id: str, title: str, content: str, api_key: str) -> dict:
-    """
-    Creates a new page in a Notion database using the actual Notion API.
-    """
-    print(f"NOTION AGENT: Received request to create page titled '{title}' in DB '{database_id}'.")
-    if not api_key or "YOUR_NOTION_API_KEY" in api_key:
-        print("NOTION AGENT: ERROR - Missing or invalid API Key.")
-        return {"error": "Authentication error: Notion API key is missing or invalid."}
+    async def execute(self, context: RequestContext, event_queue: EventQueue):
+        task_updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+        
+        try:
+            api_key = self.get_api_key_from_context(context)
+            tool_call_str = context.get_user_input()
+            tool_call = json.loads(tool_call_str)
+            tool_args = tool_call.get("args", {})
+            
+            result = self.create_page_in_database(api_key=api_key, **tool_args)
+            result_str = json.dumps(result)
+            
+            final_message = task_updater.new_agent_message(parts=[Part(root=TextPart(text=result_str))])
+            await task_updater.complete(message=final_message)
+        except Exception as e:
+            traceback.print_exc()
+            error_message = task_updater.new_agent_message(parts=[Part(root=TextPart(text=f"Failed to execute Notion tool: {str(e)}"))])
+            await task_updater.failed(message=error_message)
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue): pass
+
+# --- Agent Server Setup ---
+if __name__ == "__main__":
+    AGENT_DID = "did:agent:notion"
+    AGENT_URL = f"http://localhost:8005/a2a/{AGENT_DID}"
+    REGISTRY_URL = "http://localhost:8004"
     
-    try:
-        # Initialize the Notion client with the user-specific API key
-        notion = notion_client.Client(auth=api_key)
-        
-        print("NOTION AGENT: Authentication successful. Creating page...")
-        
-        # Define the structure for the new page
-        parent = {"database_id": database_id}
-        properties = {
-            "title": {
-                "title": [{"text": {"content": title}}]
-            }
-        }
-        children = [
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{"type": "text", "text": {"content": content}}]
-                }
-            }
-        ]
-        
-        # Make the API call to create the page
-        response = notion.pages.create(parent=parent, properties=properties, children=children)
-        
-        print(f"NOTION AGENT: Successfully created page. URL: {response['url']}")
-        
-        return {
-            "status": "success",
-            "page_url": response['url']
-        }
-    except notion_client.errors.APIResponseError as e:
-        print(f"NOTION AGENT: Notion API Error - {e}")
-        return {"error": f"Notion API Error: {e}"}
-    except Exception as e:
-        print(f"NOTION AGENT: An unexpected error occurred - {e}")
-        return {"error": f"An unexpected error occurred: {e}"}
-
-# ... (The rest of the file remains the same) ...
-
-# --- 2. Create the A2A Endpoint ---
-@app.post("/a2a/{agent_did:path}")
-async def handle_a2a_request(agent_did: str, request: Request):
-    if agent_did != NOTION_AGENT_DID:
-        raise HTTPException(status_code=404, detail="Agent DID not found.")
-    print(f"NOTION AGENT: Received A2A request for {agent_did}")
-    api_key = request.headers.get("X-Notion-API-Key")
-    if not api_key:
-        raise HTTPException(status_code=401, detail="X-Notion-API-Key header is required.")
-    a2a_request = None
-    try:
-        body = await request.json()
-        a2a_request = SendMessageRequest.model_validate(body)
-        tool_call_str = a2a_request.params.message.parts[0].root.text
-        tool_call = json.loads(tool_call_str)
-        tool_name = tool_call.get("tool_name")
-        tool_args = tool_call.get("args", {})
-        if tool_name == "create_page_in_database":
-            result = create_page_in_database(
-                database_id=tool_args.get("database_id"),
-                title=tool_args.get("title"),
-                content=tool_args.get("content"),
-                api_key=api_key
-            )
-            final_answer = json.dumps(result)
-        else:
-            final_answer = json.dumps({"error": f"Tool '{tool_name}' not supported by this agent."})
-        reply_message = create_text_message_object(role=Role.agent, content=final_answer)
-        response_payload = SendMessageSuccessResponse(id=a2a_request.id, result=reply_message)
-        return response_payload.model_dump(mode='json', exclude_none=True)
-    except Exception as e:
-        print(f"NOTION AGENT ERROR: {e}"); traceback.print_exc()
-        request_id = a2a_request.id if a2a_request else "unknown"
-        error_response = {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(e)}}
-        return JSONResponse(content=error_response, status_code=500)
-
-# --- 3. Agent Self-Registration on Startup ---
-@app.on_event("startup")
-async def startup_event():
-    notion_skill = AgentSkill(
-        id="create_page_in_database",
-        name="Create Notion Page",
-        description="Creates a new page with specified content and title in a Notion database. Expects a JSON input with 'database_id', 'title', and 'content'.",
-        tags=["notion", "database", "writing"]
-    )
     agent_card = AgentCard(
         name="Notion Agent",
-        description="A specialized worker agent that interacts with the Notion API.",
-        version="1.0",
-        url=NOTION_AGENT_URL,
-        capabilities={"streaming": False},
-        defaultInputModes=["application/json"],
-        defaultOutputModes=["application/json"],
-        skills=[notion_skill]
+        description="A specialized worker agent that interacts with the Notion API on behalf of a user.",
+        version="1.0", url=AGENT_URL, capabilities={"streaming": False},
+        defaultInputModes=["application/json"], defaultOutputModes=["application/json"],
+        skills=[AgentSkill(
+            id="create_page_in_database", name="Create Notion Page",
+            description="Creates a page in a Notion database. Requires 'X-Notion-API-Key' header.",
+            tags=["notion", "database"]
+        )]
     )
-    print("NOTION AGENT: Attempting to register with the registry...")
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(f"{REGISTRY_URL}/register", json={"agent_card": agent_card.model_dump(mode='json')}, timeout=5.0)
-            print(f"NOTION AGENT: Successfully registered with DID '{NOTION_AGENT_DID}'.")
-    except Exception as e:
-        print(f"NOTION AGENT: CRITICAL - Could not register with the directory. Is the registry server running at {REGISTRY_URL}? Error: {e}")
+    
+    executor = NotionAgentExecutor()
+    handler = DefaultRequestHandler(agent_executor=executor, task_store=InMemoryTaskStore())
+    a2a_app = A2AStarletteApplication(agent_card=agent_card, http_handler=handler)
 
-if __name__ == "__main__":
+    async def startup_event():
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(f"{REGISTRY_URL}/register", json={"agent_card": agent_card.model_dump(mode='json')})
+            print(f"NOTION AGENT: Successfully registered with DID '{AGENT_DID}'.")
+        except Exception as e:
+            print(f"NOTION AGENT: CRITICAL - Could not register. Error: {e}")
+
+    app = a2a_app.build(rpc_url=f"/a2a/{AGENT_DID}", on_startup=[startup_event])
+    
     print("--- Starting AgentOS Notion Agent ---")
-    print(f"This agent will register itself as '{NOTION_AGENT_DID}'")
     uvicorn.run(app, host="127.0.0.1", port=8005)
